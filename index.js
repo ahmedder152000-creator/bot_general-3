@@ -49,6 +49,11 @@ db.serialize(() => {
 // Config
 const { BOT_TOKEN, LOG_CHANNEL_ID, MOD_ROLE_ID, AUTO_ROLE_ID, VOICE_CHANNEL_ID, WELCOME_CHANNEL_ID } = process.env;
 
+// Welcome channel ID and Auto Role ID (hardcoded as requested)
+const WELCOME_IMAGE_URL = "https://media.discordapp.net/attachments/1504944590162231326/1509687379198345378/BBCD65E5-E8A2-47BB-80A0-0A208431F3A6.png?ex=6a1abe2f&is=6a196caf&hm=b8d17e03f0614a9b9b92f10337f0cf995542b06646d7771e3393a5e2e2bb4d25&=&format=webp&quality=lossless&width=1705&height=682";
+const AUTO_ROLE_ID_FIXED = "1508206937991413800";
+const WELCOME_CHANNEL_ID_FIXED = "1509920672866897962";
+
 if (!BOT_TOKEN) {
     console.error('❌ Missing BOT_TOKEN in .env file');
     process.exit(1);
@@ -753,18 +758,43 @@ async function removeRoleFromAllMembers(guild, roleId, author) {
     return { success: true, successCount, failCount };
 }
 
-// Welcome message
-async function sendWelcome(member) {
-    const channel = member.guild.channels.cache.get(WELCOME_CHANNEL_ID);
-    if (!channel) return;
-    const embed = new EmbedBuilder()
+// ========== WELCOME MESSAGE WITH AUTO ROLE AND IMAGE ==========
+async function sendWelcomeWithImage(member) {
+    const welcomeChannel = member.guild.channels.cache.get(WELCOME_CHANNEL_ID_FIXED);
+    if (!welcomeChannel) {
+        console.log(`⚠️ Welcome channel ${WELCOME_CHANNEL_ID_FIXED} not found!`);
+        return;
+    }
+    
+    // Add auto role to the new member
+    const autoRole = member.guild.roles.cache.get(AUTO_ROLE_ID_FIXED);
+    if (autoRole) {
+        try {
+            await member.roles.add(autoRole);
+            console.log(`✅ Added auto role ${autoRole.name} to ${member.user.tag}`);
+        } catch (error) {
+            console.error(`❌ Failed to add auto role to ${member.user.tag}:`, error.message);
+        }
+    } else {
+        console.log(`⚠️ Auto role ${AUTO_ROLE_ID_FIXED} not found!`);
+    }
+    
+    // Create welcome embed with image
+    const welcomeEmbed = new EmbedBuilder()
         .setColor(0x5865F2)
-        .setTitle(`🎉 WELCOME TO ${member.guild.name.toUpperCase()} 🎉`)
-        .setDescription(`Hey ${member.toString()}! Welcome to the community! ✨\n\nWe are glad to have you here.`)
+        .setTitle(`🎉 WELCOME TO ${member.guild.name.toUpperCase()}! 🎉`)
+        .setDescription(`**Hey ${member.toString()}!** Welcome to the community! ✨\n\nWe're excited to have you here. Feel free to introduce yourself and enjoy your stay!`)
+        .setImage(WELCOME_IMAGE_URL)
         .setThumbnail(member.user.displayAvatarURL({ size: 1024, dynamic: true }))
-        .setTimestamp()
-        .setFooter({ text: member.guild.name });
-    await channel.send({ content: `${member.toString()}`, embeds: [embed] });
+        .addFields(
+            { name: '📅 Member Since', value: `<t:${Math.floor(Date.now() / 1000)}:R>`, inline: true },
+            { name: '👋 Total Members', value: `${member.guild.memberCount}`, inline: true },
+            { name: '📚 Useful Commands', value: 'Use `-help` to see all available commands!', inline: false }
+        )
+        .setFooter({ text: `Welcome ${member.user.username}!`, iconURL: member.guild.iconURL() })
+        .setTimestamp();
+    
+    await welcomeChannel.send({ content: `${member.toString()}`, embeds: [welcomeEmbed] });
 }
 
 // Voice time saving
@@ -1236,14 +1266,12 @@ client.on('messageCreate', async (message) => {
     }
     
     // ========== KHITAR COMMAND ==========
-    // -khtar <message_id>
     if (cmd === 'khtar') {
         const messageId = args[0];
         if (!messageId) {
             return message.reply('❌ Usage: `-khtar <message_id>`\n\nExample: `-khtar 123456789012345678`\n\nThis will randomly pick a winner from all users who reacted to the specified message.');
         }
         
-        // Check if user has permission
         if (!isMod(message.member)) {
             return message.reply('❌ Permission denied! This command can only be used by moderators.');
         }
@@ -1380,7 +1408,7 @@ client.on('messageCreate', async (message) => {
     const modCmds = ['ban', 'kick', 'mute', 'unmute', 'warn', 'clear', 'lock', 'unlock', 'giverole', 'removerole', 'unban', 'ann', 'anni', 'ticketsetup', 'ticket', 'roltest', 'verif', 'sendpanel', 'verifstatus', 'resetverif', 'freegame', 'stopfreegame'];
     if (modCmds.includes(cmd) && !isMod(member)) return message.reply('❌ Permission denied!');
     
-    // HELP (Updated with new commands)
+    // HELP
     if (cmd === 'help') {
         const embed = new EmbedBuilder().setColor(0x5865F2).setTitle('🛡️ Commands')
             .setDescription('**Prefix:** `-`')
@@ -1696,26 +1724,19 @@ client.on('messageCreate', async (message) => {
     }
     if (cmd === 'anni') {
         await message.delete();
-        await sendWelcome(channel);
+        await sendWelcomeWithImage(message.member);
         return;
     }
 });
 
 // ========== ANTI-LINK SYSTEM ==========
-// Deletes ANY message containing a link, regardless of permissions
 client.on('messageCreate', async (message) => {
-    // Ignore bot messages and DMs
     if (message.author?.bot || !message.guild) return;
-    
-    // Don't delete command messages
     if (message.content.startsWith('-')) return;
     
-    // Check for ANY link pattern
     if (LINK_REGEX.test(message.content)) {
-        // Delete the message immediately
         await message.delete().catch(() => {});
         
-        // Send warning to the user (can't DM, send in channel)
         const warnEmbed = new EmbedBuilder()
             .setColor(0xEF4444)
             .setTitle('🚫 Links Are Not Allowed')
@@ -1724,14 +1745,10 @@ client.on('messageCreate', async (message) => {
             .setTimestamp();
         
         const warnMsg = await message.channel.send({ embeds: [warnEmbed] });
-        
-        // Auto-delete warning after 5 seconds
         setTimeout(() => warnMsg.delete().catch(() => {}), 5000);
         
-        // Log to console
         console.log(`🔗 Link deleted from ${message.author.tag} in ${message.guild.name}`);
         
-        // Send to log channel if configured
         const logChannel = message.guild.channels.cache.get(LOG_CHANNEL_ID);
         if (logChannel) {
             const logEmbed = new EmbedBuilder()
@@ -1749,16 +1766,12 @@ client.on('messageCreate', async (message) => {
 });
 
 // ========== ANTI-BOT SYSTEM ==========
-// Bans any bot added to the server immediately
 client.on('guildMemberAdd', async (member) => {
-    // Check if the new member is a bot
     if (member.user.bot) {
-        // Ban the bot immediately
         try {
             await member.ban({ reason: 'Anti-Bot Protection: Bots are not allowed in this server' });
             console.log(`🤖 Banned bot: ${member.user.tag} from ${member.guild.name}`);
             
-            // Log to channel
             const logChannel = member.guild.channels.cache.get(LOG_CHANNEL_ID);
             if (logChannel) {
                 const embed = new EmbedBuilder()
@@ -1774,8 +1787,6 @@ client.on('guildMemberAdd', async (member) => {
             }
         } catch (error) {
             console.error(`Failed to ban bot ${member.user.tag}:`, error.message);
-            
-            // Try to kick if ban fails
             try {
                 await member.kick('Anti-Bot Protection');
                 console.log(`🤖 Kicked bot: ${member.user.tag}`);
@@ -1786,9 +1797,7 @@ client.on('guildMemberAdd', async (member) => {
     }
 });
 
-// Also check for bots added via any other method (guildMemberUpdate)
 client.on('guildMemberUpdate', async (oldMember, newMember) => {
-    // If the member is a bot and wasn't banned before
     if (newMember.user.bot && !newMember.bannable) {
         try {
             await newMember.ban({ reason: 'Anti-Bot Protection' });
@@ -1799,9 +1808,14 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
     }
 });
 
+// ========== AUTO ROLE & WELCOME FOR NEW MEMBERS ==========
+client.on('guildMemberAdd', async (member) => {
+    if (member.user.bot) return;
+    await sendWelcomeWithImage(member);
+});
+
 // Auto Voice System Voice State Handler
 client.on('voiceStateUpdate', async (oldState, newState) => {
-    // Auto-create personal voice channel
     if (newState.channelId && !oldState.channelId) {
         const autoVoice = await getAutoVoice(newState.guild.id, newState.member.id);
         if (autoVoice && autoVoice.channel_id === newState.channelId) {
@@ -1811,7 +1825,6 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
         }
     }
     
-    // Auto-delete empty personal voice channels
     if (oldState.channelId && !newState.channelId) {
         const channel = oldState.channel;
         if (channel && channel.members.size === 0) {
@@ -1841,17 +1854,6 @@ client.on('voiceStateUpdate', async (old, neu) => {
     }
 });
 
-// Member join (for regular members)
-client.on('guildMemberAdd', async (member) => {
-    // Skip bots (already handled by anti-bot)
-    if (member.user.bot) return;
-    
-    await sendWelcome(member);
-    const vcfg = await getVerif(member.guild.id);
-    if (vcfg?.auto_role) await member.roles.add(vcfg.auto_role);
-    else if (AUTO_ROLE_ID) await member.roles.add(AUTO_ROLE_ID);
-});
-
 // Message stats
 client.on('messageCreate', async (msg) => {
     if (msg.author.bot || !msg.guild) return;
@@ -1861,10 +1863,8 @@ client.on('messageCreate', async (msg) => {
 
 // Button, Modal, and Select Menu interactions
 client.on('interactionCreate', async (interaction) => {
-    // Handle voice control buttons
     if (interaction.isButton() && await handleVoiceControl(interaction)) return;
     
-    // Handle select menus for voice control
     if (interaction.isStringSelectMenu()) {
         if (interaction.customId.startsWith('vc_kick_select_')) {
             const channelId = interaction.customId.replace('vc_kick_select_', '');
@@ -1912,7 +1912,6 @@ client.on('interactionCreate', async (interaction) => {
         }
     }
     
-    // Handle modals for voice control
     if (interaction.isModalSubmit()) {
         if (interaction.customId.startsWith('vc_rename_modal_')) {
             const channelId = interaction.customId.replace('vc_rename_modal_', '');
@@ -1952,7 +1951,6 @@ client.on('interactionCreate', async (interaction) => {
         }
     }
     
-    // Verification button
     if (interaction.isButton() && interaction.customId === 'verify_button') {
         const cfg = await getVerif(interaction.guild.id);
         if (!cfg) return interaction.reply({ content: '❌ Not configured', ephemeral: true });
@@ -1962,7 +1960,6 @@ client.on('interactionCreate', async (interaction) => {
         return;
     }
     
-    // Reaction role buttons
     if (interaction.isButton() && (interaction.customId === 'role_phone' || interaction.customId === 'role_pc')) {
         const roles = await getRR(interaction.guild.id, interaction.message.id);
         const targetEmoji = interaction.customId === 'role_phone' ? '📱' : '💻';
@@ -1978,7 +1975,6 @@ client.on('interactionCreate', async (interaction) => {
         return;
     }
     
-    // Ticket buttons
     if (interaction.isButton() && interaction.customId === 'create_ticket') {
         const existing = await getTicket(interaction.user.id, interaction.guild.id);
         if (existing) return interaction.reply({ content: `❌ You have a ticket: <#${existing.channel_id}>`, ephemeral: true });
@@ -2019,7 +2015,6 @@ client.on('interactionCreate', async (interaction) => {
         return;
     }
     
-    // Giveaway confirmation buttons
     if (interaction.isButton() && (interaction.customId === 'confirm_giveaway' || interaction.customId === 'cancel_giveaway')) {
         return;
     }
@@ -2041,10 +2036,12 @@ client.once('ready', async () => {
     console.log(`   • -voice add <channel_id> - Enable auto personal VC`);
     console.log(`   • -cn <channel_id> - Send control panel to text channel`);
     console.log(`   • Personal channels use username only (no suffix)`);
-    console.log(`   • Full control panel with: Lock, Unlock, Hide, Unhide, Kick, Mute All, Unmute All, Rename, User Limit, Transfer Ownership`);
     console.log(`🛡️ Protection Systems:`);
     console.log(`   • 🔗 Anti-Link: ALL links are deleted immediately`);
     console.log(`   • 🤖 Anti-Bot: Any bot added is instantly banned`);
+    console.log(`🎁 Welcome System:`);
+    console.log(`   • Auto Role: ${AUTO_ROLE_ID_FIXED} - Given to every new member`);
+    console.log(`   • Welcome Channel: ${WELCOME_CHANNEL_ID_FIXED} - Welcome message with image`);
     console.log(`📋 Other Commands: -help for full list`);
     client.user.setActivity('-help for commands', { type: 3 });
     setTimeout(() => joinVoiceChannelProper(), 3000);
