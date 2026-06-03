@@ -23,6 +23,14 @@ db.serialize(() => {
     db.run(`CREATE TABLE IF NOT EXISTS user_stats (user_id TEXT PRIMARY KEY, messages INTEGER DEFAULT 0, voice_minutes INTEGER DEFAULT 0, xp INTEGER DEFAULT 0, level INTEGER DEFAULT 1)`);
     db.run(`CREATE TABLE IF NOT EXISTS free_games_sent (id INTEGER PRIMARY KEY AUTOINCREMENT, game_id TEXT UNIQUE, sent_at TEXT)`);
     
+    // Store users who had the auto role (for re-adding when they rejoin)
+    db.run(`CREATE TABLE IF NOT EXISTS auto_role_users (
+        user_id TEXT PRIMARY KEY,
+        guild_id TEXT,
+        had_role INTEGER DEFAULT 1,
+        last_seen TEXT
+    )`);
+    
     // Giveaway table
     db.run(`CREATE TABLE IF NOT EXISTS giveaways (
         id TEXT PRIMARY KEY,
@@ -83,6 +91,9 @@ const userPersonalChannels = new Map(); // Track which personal channel belongs 
 
 // Anti-spam tracking
 const messageCooldown = new Map();
+
+// Store users who had auto role (in-memory cache)
+const autoRoleUsersCache = new Set();
 
 // Free games list
 const FREE_STEAM_GAMES = [
@@ -253,6 +264,30 @@ function addWarning(uid, gid, reason, mod) {
 function getWarnCount(uid, gid) {
     return new Promise((r) => {
         db.get(`SELECT COUNT(*) as c FROM warnings WHERE user_id = ? AND guild_id = ?`, [uid, gid], (err, row) => r(row ? row.c : 0));
+    });
+}
+
+// ========== AUTO ROLE DATABASE FUNCTIONS ==========
+function saveAutoRoleUser(userId, guildId) {
+    return new Promise((resolve) => {
+        db.run(`INSERT OR REPLACE INTO auto_role_users (user_id, guild_id, had_role, last_seen) VALUES (?, ?, 1, ?)`,
+            [userId, guildId, new Date().toISOString()], () => {
+                autoRoleUsersCache.add(`${guildId}-${userId}`);
+                resolve();
+            });
+    });
+}
+
+function hadAutoRoleBefore(userId, guildId) {
+    return new Promise((resolve) => {
+        const cached = autoRoleUsersCache.has(`${guildId}-${userId}`);
+        if (cached) {
+            resolve(true);
+            return;
+        }
+        db.get(`SELECT * FROM auto_role_users WHERE user_id = ? AND guild_id = ?`, [userId, guildId], (err, row) => {
+            resolve(!!row);
+        });
     });
 }
 
@@ -458,7 +493,6 @@ async function getAutoVoice(guildId, userId) {
 
 async function createPersonalVoiceChannel(member, triggerChannel) {
     const category = triggerChannel.parent;
-    // Use only username without any suffix
     const channelName = member.user.username;
     
     try {
@@ -486,7 +520,6 @@ async function createPersonalVoiceChannel(member, triggerChannel) {
             ]
         });
         
-        // Store mapping
         userPersonalChannels.set(newChannel.id, member.id);
         
         await member.voice.setChannel(newChannel);
@@ -504,7 +537,6 @@ async function sendVoiceControlPanel(textChannel, voiceChannelId) {
         return textChannel.send('❌ Invalid voice channel ID! Please provide a valid voice channel ID.');
     }
     
-    // Check if this channel belongs to the user
     const channelOwner = userPersonalChannels.get(voiceChannel.id);
     if (channelOwner !== textChannel.author.id && !isMod(textChannel.member)) {
         return textChannel.send('❌ You can only control your own personal voice channel!');
@@ -522,99 +554,51 @@ async function sendVoiceControlPanel(textChannel, voiceChannelId) {
         .setFooter({ text: 'Use the buttons below to manage your voice channel' })
         .setTimestamp();
     
-    // Create action rows with buttons
     const row1 = new ActionRowBuilder()
         .addComponents(
-            new ButtonBuilder()
-                .setCustomId(`vc_lock_${voiceChannel.id}`)
-                .setLabel('🔒 Lock')
-                .setStyle(ButtonStyle.Secondary)
-                .setEmoji('🔒'),
-            new ButtonBuilder()
-                .setCustomId(`vc_unlock_${voiceChannel.id}`)
-                .setLabel('🔓 Unlock')
-                .setStyle(ButtonStyle.Secondary)
-                .setEmoji('🔓'),
-            new ButtonBuilder()
-                .setCustomId(`vc_hide_${voiceChannel.id}`)
-                .setLabel('👻 Hide')
-                .setStyle(ButtonStyle.Secondary)
-                .setEmoji('👻'),
-            new ButtonBuilder()
-                .setCustomId(`vc_unhide_${voiceChannel.id}`)
-                .setLabel('👁️ Unhide')
-                .setStyle(ButtonStyle.Secondary)
-                .setEmoji('👁️')
+            new ButtonBuilder().setCustomId(`vc_lock_${voiceChannel.id}`).setLabel('🔒 Lock').setStyle(ButtonStyle.Secondary).setEmoji('🔒'),
+            new ButtonBuilder().setCustomId(`vc_unlock_${voiceChannel.id}`).setLabel('🔓 Unlock').setStyle(ButtonStyle.Secondary).setEmoji('🔓'),
+            new ButtonBuilder().setCustomId(`vc_hide_${voiceChannel.id}`).setLabel('👻 Hide').setStyle(ButtonStyle.Secondary).setEmoji('👻'),
+            new ButtonBuilder().setCustomId(`vc_unhide_${voiceChannel.id}`).setLabel('👁️ Unhide').setStyle(ButtonStyle.Secondary).setEmoji('👁️')
         );
     
     const row2 = new ActionRowBuilder()
         .addComponents(
-            new ButtonBuilder()
-                .setCustomId(`vc_kick_${voiceChannel.id}`)
-                .setLabel('👢 Kick User')
-                .setStyle(ButtonStyle.Danger)
-                .setEmoji('👢'),
-            new ButtonBuilder()
-                .setCustomId(`vc_muteall_${voiceChannel.id}`)
-                .setLabel('🔇 Mute All')
-                .setStyle(ButtonStyle.Danger)
-                .setEmoji('🔇'),
-            new ButtonBuilder()
-                .setCustomId(`vc_unmuteall_${voiceChannel.id}`)
-                .setLabel('🔊 Unmute All')
-                .setStyle(ButtonStyle.Success)
-                .setEmoji('🔊')
+            new ButtonBuilder().setCustomId(`vc_kick_${voiceChannel.id}`).setLabel('👢 Kick User').setStyle(ButtonStyle.Danger).setEmoji('👢'),
+            new ButtonBuilder().setCustomId(`vc_muteall_${voiceChannel.id}`).setLabel('🔇 Mute All').setStyle(ButtonStyle.Danger).setEmoji('🔇'),
+            new ButtonBuilder().setCustomId(`vc_unmuteall_${voiceChannel.id}`).setLabel('🔊 Unmute All').setStyle(ButtonStyle.Success).setEmoji('🔊')
         );
     
     const row3 = new ActionRowBuilder()
         .addComponents(
-            new ButtonBuilder()
-                .setCustomId(`vc_rename_${voiceChannel.id}`)
-                .setLabel('✏️ Rename')
-                .setStyle(ButtonStyle.Primary)
-                .setEmoji('✏️'),
-            new ButtonBuilder()
-                .setCustomId(`vc_limit_${voiceChannel.id}`)
-                .setLabel('👥 User Limit')
-                .setStyle(ButtonStyle.Primary)
-                .setEmoji('👥'),
-            new ButtonBuilder()
-                .setCustomId(`vc_transfer_${voiceChannel.id}`)
-                .setLabel('🔄 Transfer')
-                .setStyle(ButtonStyle.Primary)
-                .setEmoji('🔄')
+            new ButtonBuilder().setCustomId(`vc_rename_${voiceChannel.id}`).setLabel('✏️ Rename').setStyle(ButtonStyle.Primary).setEmoji('✏️'),
+            new ButtonBuilder().setCustomId(`vc_limit_${voiceChannel.id}`).setLabel('👥 User Limit').setStyle(ButtonStyle.Primary).setEmoji('👥'),
+            new ButtonBuilder().setCustomId(`vc_transfer_${voiceChannel.id}`).setLabel('🔄 Transfer').setStyle(ButtonStyle.Primary).setEmoji('🔄')
         );
     
     const row4 = new ActionRowBuilder()
         .addComponents(
-            new ButtonBuilder()
-                .setCustomId(`vc_info_${voiceChannel.id}`)
-                .setLabel('ℹ️ Info')
-                .setStyle(ButtonStyle.Secondary)
-                .setEmoji('ℹ️')
+            new ButtonBuilder().setCustomId(`vc_info_${voiceChannel.id}`).setLabel('ℹ️ Info').setStyle(ButtonStyle.Secondary).setEmoji('ℹ️')
         );
     
     await textChannel.send({ embeds: [embed], components: [row1, row2, row3, row4] });
 }
 
-// ========== KHITAR COMMAND (RANDOM WINNER PICKER) ==========
+// ========== KHITAR COMMAND ==========
 async function khtarWinner(message, messageId) {
     try {
-        // Fetch the message from the same channel
         const targetMessage = await message.channel.messages.fetch(messageId);
         
         if (!targetMessage) {
             return message.reply('❌ Message not found! Make sure the message ID is correct and in this channel.');
         }
         
-        // Get all reactions
         const reactions = targetMessage.reactions.cache;
         
         if (reactions.size === 0) {
             return message.reply('❌ No reactions found on that message!');
         }
         
-        // Collect all users who reacted (excluding bots)
         const allReactors = new Set();
         
         for (const [emoji, reaction] of reactions) {
@@ -636,11 +620,9 @@ async function khtarWinner(message, messageId) {
             return message.reply('❌ No valid users found in the reactions! (Bots are ignored)');
         }
         
-        // Pick random winner
         const randomIndex = Math.floor(Math.random() * reactorList.length);
         const winner = reactorList[randomIndex];
         
-        // Create winner announcement embed
         const embed = new EmbedBuilder()
             .setColor(0xFFD700)
             .setTitle('🎉 KHITAR - WINNER SELECTED 🎉')
@@ -655,7 +637,6 @@ async function khtarWinner(message, messageId) {
         
         await message.reply({ content: `🎉 Congratulations ${winner.toString()}! 🎉`, embeds: [embed] });
         
-        // Also send a direct message to the winner
         try {
             await winner.send({
                 embeds: [
@@ -663,9 +644,7 @@ async function khtarWinner(message, messageId) {
                         .setColor(0xFFD700)
                         .setTitle('🎉 You Won a Giveaway! 🎉')
                         .setDescription(`You were randomly selected as the winner in **${message.guild.name}**!`)
-                        .addFields(
-                            { name: '📝 Message Link', value: `[Click here](${targetMessage.url})`, inline: true }
-                        )
+                        .addFields({ name: '📝 Message Link', value: `[Click here](${targetMessage.url})`, inline: true })
                         .setTimestamp()
                 ]
             });
@@ -695,11 +674,10 @@ async function assignRoleToAllMembers(guild, roleId, author) {
     const members = await guild.members.fetch();
     const totalMembers = members.size;
     
-    // Send initial message
     const statusMsg = await author.send(`🔄 Assigning role **${role.name}** to all ${totalMembers} members... This may take a while.`);
     
     for (const [memberId, member] of members) {
-        if (member.user.bot) continue; // Skip bots
+        if (member.user.bot) continue;
         
         try {
             if (!member.roles.cache.has(roleId)) {
@@ -711,7 +689,6 @@ async function assignRoleToAllMembers(guild, roleId, author) {
             console.error(`Failed to add role to ${member.user.tag}:`, error.message);
         }
         
-        // Update status every 50 members
         if ((successCount + failCount) % 50 === 0) {
             await statusMsg.edit(`🔄 Progress: ${successCount + failCount}/${totalMembers} | ✅ Success: ${successCount} | ❌ Failed: ${failCount}`);
         }
@@ -732,11 +709,10 @@ async function removeRoleFromAllMembers(guild, roleId, author) {
     const members = await guild.members.fetch();
     const totalMembers = members.size;
     
-    // Send initial message
     const statusMsg = await author.send(`🔄 Removing role **${role.name}** from all members... This may take a while.`);
     
     for (const [memberId, member] of members) {
-        if (member.user.bot) continue; // Skip bots
+        if (member.user.bot) continue;
         
         try {
             if (member.roles.cache.has(roleId)) {
@@ -748,7 +724,6 @@ async function removeRoleFromAllMembers(guild, roleId, author) {
             console.error(`Failed to remove role from ${member.user.tag}:`, error.message);
         }
         
-        // Update status every 50 members
         if ((successCount + failCount) % 50 === 0) {
             await statusMsg.edit(`🔄 Progress: ${successCount + failCount}/${totalMembers} | ✅ Success: ${successCount} | ❌ Failed: ${failCount}`);
         }
@@ -766,35 +741,62 @@ async function sendWelcomeWithImage(member) {
         return;
     }
     
-    // Add auto role to the new member
     const autoRole = member.guild.roles.cache.get(AUTO_ROLE_ID_FIXED);
     if (autoRole) {
         try {
-            await member.roles.add(autoRole);
-            console.log(`✅ Added auto role ${autoRole.name} to ${member.user.tag}`);
+            // Check if user had the role before (left and rejoined)
+            const hadRoleBefore = await hadAutoRoleBefore(member.id, member.guild.id);
+            
+            if (hadRoleBefore) {
+                // User is returning, re-add the role
+                await member.roles.add(autoRole);
+                console.log(`✅ Re-added auto role to returning member: ${member.user.tag}`);
+                
+                // Send returning welcome message
+                const returnEmbed = new EmbedBuilder()
+                    .setColor(0x5865F2)
+                    .setTitle(`🎉 WELCOME BACK TO ${member.guild.name.toUpperCase()}! 🎉`)
+                    .setDescription(`**Hey ${member.toString()}!** Welcome back to the community! ✨\n\nWe're happy to see you again!`)
+                    .setImage(WELCOME_IMAGE_URL)
+                    .setThumbnail(member.user.displayAvatarURL({ size: 1024, dynamic: true }))
+                    .addFields(
+                        { name: '📅 Returned', value: `<t:${Math.floor(Date.now() / 1000)}:R>`, inline: true },
+                        { name: '👋 Total Members', value: `${member.guild.memberCount}`, inline: true },
+                        { name: '📚 Useful Commands', value: 'Use `-help` to see all available commands!', inline: false }
+                    )
+                    .setFooter({ text: `Welcome back ${member.user.username}!`, iconURL: member.guild.iconURL() })
+                    .setTimestamp();
+                
+                await welcomeChannel.send({ content: `${member.toString()}`, embeds: [returnEmbed] });
+            } else {
+                // New member, add role and save to database
+                await member.roles.add(autoRole);
+                await saveAutoRoleUser(member.id, member.guild.id);
+                console.log(`✅ Added auto role to new member: ${member.user.tag}`);
+                
+                // Send new member welcome message
+                const welcomeEmbed = new EmbedBuilder()
+                    .setColor(0x5865F2)
+                    .setTitle(`🎉 WELCOME TO ${member.guild.name.toUpperCase()}! 🎉`)
+                    .setDescription(`**Hey ${member.toString()}!** Welcome to the community! ✨\n\nWe're excited to have you here. Feel free to introduce yourself and enjoy your stay!`)
+                    .setImage(WELCOME_IMAGE_URL)
+                    .setThumbnail(member.user.displayAvatarURL({ size: 1024, dynamic: true }))
+                    .addFields(
+                        { name: '📅 Member Since', value: `<t:${Math.floor(Date.now() / 1000)}:R>`, inline: true },
+                        { name: '👋 Total Members', value: `${member.guild.memberCount}`, inline: true },
+                        { name: '📚 Useful Commands', value: 'Use `-help` to see all available commands!', inline: false }
+                    )
+                    .setFooter({ text: `Welcome ${member.user.username}!`, iconURL: member.guild.iconURL() })
+                    .setTimestamp();
+                
+                await welcomeChannel.send({ content: `${member.toString()}`, embeds: [welcomeEmbed] });
+            }
         } catch (error) {
             console.error(`❌ Failed to add auto role to ${member.user.tag}:`, error.message);
         }
     } else {
         console.log(`⚠️ Auto role ${AUTO_ROLE_ID_FIXED} not found!`);
     }
-    
-    // Create welcome embed with image
-    const welcomeEmbed = new EmbedBuilder()
-        .setColor(0x5865F2)
-        .setTitle(`🎉 WELCOME TO ${member.guild.name.toUpperCase()}! 🎉`)
-        .setDescription(`**Hey ${member.toString()}!** Welcome to the community! ✨\n\nWe're excited to have you here. Feel free to introduce yourself and enjoy your stay!`)
-        .setImage(WELCOME_IMAGE_URL)
-        .setThumbnail(member.user.displayAvatarURL({ size: 1024, dynamic: true }))
-        .addFields(
-            { name: '📅 Member Since', value: `<t:${Math.floor(Date.now() / 1000)}:R>`, inline: true },
-            { name: '👋 Total Members', value: `${member.guild.memberCount}`, inline: true },
-            { name: '📚 Useful Commands', value: 'Use `-help` to see all available commands!', inline: false }
-        )
-        .setFooter({ text: `Welcome ${member.user.username}!`, iconURL: member.guild.iconURL() })
-        .setTimestamp();
-    
-    await welcomeChannel.send({ content: `${member.toString()}`, embeds: [welcomeEmbed] });
 }
 
 // Voice time saving
@@ -983,7 +985,6 @@ async function handleVoiceControl(interaction) {
         return true;
     }
     
-    // Check ownership
     const channelOwner = userPersonalChannels.get(voiceChannel.id);
     if (channelOwner !== interaction.user.id && !isMod(interaction.member)) {
         await interaction.reply({ content: '❌ You can only control your own personal voice channel!', ephemeral: true });
@@ -1182,7 +1183,6 @@ client.on('messageCreate', async (message) => {
     
     // ========== AUTO VOICE COMMANDS ==========
     
-    // -voice add <voice_channel_id>
     if (cmd === 'voice' && args[0] === 'add') {
         const channelId = args[1];
         if (!channelId) {
@@ -1208,7 +1208,6 @@ client.on('messageCreate', async (message) => {
         return message.reply({ embeds: [embed] });
     }
     
-    // -cn <voice_channel_id> - Send control panel to current text channel
     if (cmd === 'cn') {
         const voiceChannelId = args[0];
         if (!voiceChannelId) {
@@ -1221,7 +1220,6 @@ client.on('messageCreate', async (message) => {
     
     // ========== ROLE COMMANDS ==========
     
-    // -rol <role_id> - Give role to all members
     if (cmd === 'rol') {
         if (!isMod(message.member)) {
             return message.reply('❌ Permission denied! You need moderator permissions to use this command.');
@@ -1243,7 +1241,6 @@ client.on('messageCreate', async (message) => {
         return;
     }
     
-    // -norol <role_id> - Remove role from all members
     if (cmd === 'norol') {
         if (!isMod(message.member)) {
             return message.reply('❌ Permission denied! You need moderator permissions to use this command.');
@@ -1426,7 +1423,7 @@ client.on('messageCreate', async (message) => {
                 { name: '✅ Verification', value: '`-verif`, `-sendpanel`, `-verifstatus`, `-resetverif`', inline: false },
                 { name: '🛡️ Moderation', value: '`-ban`, `-kick`, `-mute`, `-unmute`, `-warn`, `-clear`, `-lock`, `-unlock`, `-giverole`, `-removerole`, `-unban`', inline: false }
             )
-            .setFooter({ text: '🔒 Anti-Link & Anti-Bot Protection: ACTIVE' })
+            .setFooter({ text: '🔒 Anti-Link & Anti-Bot Protection: ACTIVE | 👑 Auto-Role: RE-ADD ON REJOIN' })
             .setTimestamp();
         return message.reply({ embeds: [embed] });
     }
@@ -1814,6 +1811,13 @@ client.on('guildMemberAdd', async (member) => {
     await sendWelcomeWithImage(member);
 });
 
+// ========== TRACK MEMBER REMOVAL (for auto role re-add on rejoins) ==========
+client.on('guildMemberRemove', async (member) => {
+    // We don't need to do anything on leave, the database already has the record from when they first joined
+    // The hadAutoRoleBefore function will check if they ever had the role
+    console.log(`👋 Member left: ${member.user.tag} - Will re-add role if they rejoin`);
+});
+
 // Auto Voice System Voice State Handler
 client.on('voiceStateUpdate', async (oldState, newState) => {
     if (newState.channelId && !oldState.channelId) {
@@ -2041,6 +2045,7 @@ client.once('ready', async () => {
     console.log(`   • 🤖 Anti-Bot: Any bot added is instantly banned`);
     console.log(`🎁 Welcome System:`);
     console.log(`   • Auto Role: ${AUTO_ROLE_ID_FIXED} - Given to every new member`);
+    console.log(`   • Auto Role RE-ADD: When members leave and rejoin, they get the role back automatically`);
     console.log(`   • Welcome Channel: ${WELCOME_CHANNEL_ID_FIXED} - Welcome message with image`);
     console.log(`📋 Other Commands: -help for full list`);
     client.user.setActivity('-help for commands', { type: 3 });
