@@ -661,6 +661,40 @@ async function khtarWinner(message, messageId) {
     }
 }
 
+// ========== MASS DM COMMAND ==========
+async function sendMassDM(member, message, author) {
+    const guild = member.guild;
+    const members = await guild.members.fetch();
+    let successCount = 0;
+    let failCount = 0;
+    
+    const statusMsg = await author.send(`🔄 **Sending mass DM to all members...**\n📊 Total members: ${members.size}\n⏳ This may take a while...`);
+    
+    for (const [memberId, member] of members) {
+        if (member.user.bot) continue;
+        
+        try {
+            await member.send(message);
+            successCount++;
+            
+            // Update status every 10 members
+            if ((successCount + failCount) % 10 === 0) {
+                await statusMsg.edit(`🔄 **Progress:** ${successCount + failCount}/${members.size} | ✅ Success: ${successCount} | ❌ Failed: ${failCount}`);
+            }
+            
+            // Small delay to avoid rate limiting
+            await new Promise(r => setTimeout(r, 500));
+        } catch (error) {
+            failCount++;
+            console.log(`Failed to DM ${member.user.tag}: ${error.message}`);
+        }
+    }
+    
+    await statusMsg.edit(`✅ **Mass DM Completed!**\n📊 Total members: ${members.size}\n✅ Success: ${successCount}\n❌ Failed: ${failCount}\n📝 Message: ${message.substring(0, 100)}${message.length > 100 ? '...' : ''}`);
+    
+    return { successCount, failCount };
+}
+
 // ========== ROLE ASSIGNMENT FUNCTIONS ==========
 
 async function assignRoleToAllMembers(guild, roleId, author) {
@@ -1262,6 +1296,66 @@ client.on('messageCreate', async (message) => {
         return;
     }
     
+    // ========== MASS DM COMMAND ==========
+    if (cmd === 'mess') {
+        if (!isMod(message.member)) {
+            return message.reply('❌ Permission denied! You need moderator permissions to use this command.');
+        }
+        
+        const msgText = args.join(' ');
+        if (!msgText) {
+            return message.reply('❌ Usage: `-mess <message>`\nExample: `-mess Hello everyone! This is an important announcement.`\n\nThis will send the message to ALL members via DM.');
+        }
+        
+        // Confirmation message
+        const confirmEmbed = new EmbedBuilder()
+            .setColor(0xFF69B4)
+            .setTitle('📨 Mass DM Confirmation')
+            .setDescription(`⚠️ **WARNING:** This will send a DM to **ALL** members in the server!\n\n**Message:**\n> ${msgText}\n\n**Total recipients:** ${guild.memberCount} members (excluding bots)\n\nClick ✅ to confirm or ❌ to cancel.`)
+            .setTimestamp();
+        
+        const row = new ActionRowBuilder()
+            .addComponents(
+                new ButtonBuilder().setCustomId('confirm_mess').setLabel('✅ Confirm').setStyle(ButtonStyle.Success),
+                new ButtonBuilder().setCustomId('cancel_mess').setLabel('❌ Cancel').setStyle(ButtonStyle.Danger)
+            );
+        
+        const confirmMsg = await message.reply({ embeds: [confirmEmbed], components: [row] });
+        
+        const filter = (i) => i.user.id === message.author.id;
+        const collector = confirmMsg.createMessageComponentCollector({ filter, time: 30000, max: 1 });
+        
+        collector.on('collect', async (interaction) => {
+            if (interaction.customId === 'confirm_mess') {
+                await interaction.deferUpdate();
+                await confirmMsg.delete().catch(() => {});
+                
+                await message.reply(`📨 **Starting mass DM...** Check your DMs for progress updates.`);
+                const result = await sendMassDM(message.member, msgText, message.author);
+                
+                const resultEmbed = new EmbedBuilder()
+                    .setColor(0x22C55E)
+                    .setTitle('✅ Mass DM Completed!')
+                    .setDescription(`📊 **Results:**\n✅ Success: ${result.successCount}\n❌ Failed: ${result.failCount}\n📝 Message: ${msgText.substring(0, 100)}${msgText.length > 100 ? '...' : ''}`)
+                    .setTimestamp();
+                await message.reply({ embeds: [resultEmbed] });
+            } else {
+                await interaction.deferUpdate();
+                await confirmMsg.delete().catch(() => {});
+                await message.reply('❌ Mass DM cancelled.');
+            }
+        });
+        
+        collector.on('end', async (collected) => {
+            if (collected.size === 0) {
+                await confirmMsg.delete().catch(() => {});
+                await message.reply('❌ Mass DM creation timed out.');
+            }
+        });
+        
+        return;
+    }
+    
     // ========== KHITAR COMMAND ==========
     if (cmd === 'khtar') {
         const messageId = args[0];
@@ -1410,6 +1504,7 @@ client.on('messageCreate', async (message) => {
         const embed = new EmbedBuilder().setColor(0x5865F2).setTitle('🛡️ Commands')
             .setDescription('**Prefix:** `-`')
             .addFields(
+                { name: '📨 Mass DM', value: '`-mess <message>` - Send a DM to ALL members in the server', inline: false },
                 { name: '🎤 Auto Voice System', value: '`-voice add <channel_id>` - Enable auto personal VC\n`-cn <channel_id>` - Send control panel to this text channel', inline: false },
                 { name: '🤖 AI Chat', value: '`-ai <message>` - Chat naturally\n`-ask <question>` - Ask AI\n`-iahelp` - AI help', inline: false },
                 { name: '🎉 Giveaways', value: '`-gv <winners> <time> <prize>` - Create giveaway\n`-giveaways` - List active giveaways\n`-gend <id>` - End giveaway\n`-khtar <message_id>` - Pick random winner from message reactions', inline: false },
@@ -1813,8 +1908,6 @@ client.on('guildMemberAdd', async (member) => {
 
 // ========== TRACK MEMBER REMOVAL (for auto role re-add on rejoins) ==========
 client.on('guildMemberRemove', async (member) => {
-    // We don't need to do anything on leave, the database already has the record from when they first joined
-    // The hadAutoRoleBefore function will check if they ever had the role
     console.log(`👋 Member left: ${member.user.tag} - Will re-add role if they rejoin`);
 });
 
@@ -2022,6 +2115,11 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.isButton() && (interaction.customId === 'confirm_giveaway' || interaction.customId === 'cancel_giveaway')) {
         return;
     }
+    
+    // Mass DM confirmation buttons
+    if (interaction.isButton() && (interaction.customId === 'confirm_mess' || interaction.customId === 'cancel_mess')) {
+        return;
+    }
 });
 
 // Ready event
@@ -2031,6 +2129,7 @@ client.once('ready', async () => {
     console.log(`✅ ${client.user.tag} is online!`);
     console.log(`🤖 AI Chat System Ready - Natural Darija Support`);
     console.log(`📝 AI Commands: -ai <message> | -ask <question> | -iahelp`);
+    console.log(`📨 Mass DM Command: -mess <message> - Send DM to ALL members`);
     console.log(`🎉 Giveaway Command: -gv <winners> <time> <prize>`);
     console.log(`🎲 Khitar Command: -khtar <message_id> - Pick random winner from reactions`);
     console.log(`👥 Role Commands:`);
