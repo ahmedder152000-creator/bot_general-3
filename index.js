@@ -51,7 +51,7 @@ db.serialize(() => {
         PRIMARY KEY (guild_id, user_id)
     )`);
     
-    // Auto Message System table (for IP responses)
+    // Auto Message System table (for any trigger word)
     db.run(`CREATE TABLE IF NOT EXISTS auto_messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         guild_id TEXT,
@@ -474,9 +474,6 @@ async function setupVerif(msg) {
 // Anti-link regex - matches ALL types of links
 const LINK_REGEX = /(https?:\/\/[^\s]+|www\.[^\s]+|discord\.gg\/[^\s]+|discord\.com\/invite\/[^\s]+|steamcommunity\.com\/[^\s]+|twitch\.tv\/[^\s]+|youtube\.com\/[^\s]+|youtu\.be\/[^\s]+|twitter\.com\/[^\s]+|x\.com\/[^\s]+|t\.me\/[^\s]+|telegram\.me\/[^\s]+|roblox\.com\/[^\s]+)/i;
 
-// IP regex pattern (matches common IP address formats)
-const IP_REGEX = /\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b/;
-
 // Voice channel auto-join
 let currentVoiceConnection = null;
 let reconnectTimeout = null;
@@ -736,16 +733,20 @@ async function handleAutoMessage(message) {
     if (message.author.bot) return;
     if (message.content.startsWith('-')) return;
     
-    // Check for IP addresses in the message
-    const ipMatch = message.content.match(IP_REGEX);
-    if (ipMatch) {
-        const ip = ipMatch[0];
-        // Check if there's an auto message set for this IP
-        const autoResponse = await getAutoMessage(message.guild.id, ip);
-        if (autoResponse) {
+    // Check for any trigger word in the message content
+    const content = message.content.toLowerCase();
+    
+    // Get all auto messages for this guild
+    const autoMessages = await getAllAutoMessages(message.guild.id);
+    
+    for (const autoMsg of autoMessages) {
+        const triggerWord = autoMsg.trigger_word.toLowerCase();
+        // Check if the message contains the trigger word
+        if (content.includes(triggerWord)) {
             // Send the response as a reply
-            await message.reply(autoResponse);
-            console.log(`📨 Auto message triggered for IP ${ip} in ${message.guild.name}`);
+            await message.reply(autoMsg.response);
+            console.log(`📨 Auto message triggered for "${triggerWord}" in ${message.guild.name}`);
+            break; // Only trigger the first match
         }
     }
 }
@@ -1251,7 +1252,7 @@ async function handleVoiceControl(interaction) {
 
 // ========== MAIN MESSAGE HANDLER ==========
 client.on('messageCreate', async (message) => {
-    // Handle auto messages for IP addresses
+    // Handle auto messages for any trigger word
     await handleAutoMessage(message);
     
     if (message.author.bot) return;
@@ -1309,32 +1310,27 @@ client.on('messageCreate', async (message) => {
     
     // ========== AUTO MESSAGE COMMANDS ==========
     
-    // -auto mss <ip> <response> - Set auto response for an IP
+    // -auto mss <trigger> <response> - Set auto response for any word
     if (cmd === 'auto' && args[0] === 'mss') {
         if (!isMod(message.member)) {
             return message.reply('❌ Permission denied! You need moderator permissions to use this command.');
         }
         
-        const ip = args[1];
+        const trigger = args[1];
         const response = args.slice(2).join(' ');
         
-        if (!ip || !response) {
-            return message.reply('❌ Usage: `-auto mss <ip> <response>`\n\nExample: `-auto mss 192.168.1.1 This is our server IP!`\n\nWhen someone sends that IP, the bot will reply with your message.');
+        if (!trigger || !response) {
+            return message.reply('❌ Usage: `-auto mss <trigger_word> <response>`\n\nExample: `-auto mss مرحبا مرحبا بك في سيرفرنا`\n\nWhen someone sends the word "مرحبا", the bot will reply with your message.\n\n📝 **ملاحظة:** الكلمة المشغل يمكن أن تكون أي كلمة (IP، كلمة عادية، رقم، إلخ)');
         }
         
-        // Validate IP format
-        if (!IP_REGEX.test(ip)) {
-            return message.reply('❌ Invalid IP format! Please enter a valid IP address (e.g., 192.168.1.1)');
-        }
-        
-        await saveAutoMessage(guild.id, ip, response, message.author.id);
+        await saveAutoMessage(guild.id, trigger, response, message.author.id);
         
         const embed = new EmbedBuilder()
             .setColor(0x22C55E)
             .setTitle('✅ Auto Message Set')
-            .setDescription(`When someone sends the IP **${ip}**, the bot will reply with:\n> ${response}`)
+            .setDescription(`When someone sends the word **"${trigger}"**, the bot will reply with:\n> ${response}`)
             .addFields(
-                { name: 'Trigger', value: `\`${ip}\``, inline: true },
+                { name: 'Trigger Word', value: `\`${trigger}\``, inline: true },
                 { name: 'Response', value: response.substring(0, 100) + (response.length > 100 ? '...' : ''), inline: true }
             )
             .setTimestamp();
@@ -1352,7 +1348,7 @@ client.on('messageCreate', async (message) => {
         const autoMessages = await getAllAutoMessages(guild.id);
         
         if (autoMessages.length === 0) {
-            return message.reply('❌ No auto messages set in this server! Use `-auto mss <ip> <response>` to add one.');
+            return message.reply('❌ No auto messages set in this server! Use `-auto mss <trigger> <response>` to add one.');
         }
         
         const embed = new EmbedBuilder()
@@ -1368,23 +1364,23 @@ client.on('messageCreate', async (message) => {
         return;
     }
     
-    // -auto remove <ip> - Remove auto message for an IP
+    // -auto remove <trigger> - Remove auto message for a trigger word
     if (cmd === 'auto' && args[0] === 'remove') {
         if (!isMod(message.member)) {
             return message.reply('❌ Permission denied! You need moderator permissions to use this command.');
         }
         
-        const ip = args[1];
-        if (!ip) {
-            return message.reply('❌ Usage: `-auto remove <ip>`\nExample: `-auto remove 192.168.1.1`');
+        const trigger = args[1];
+        if (!trigger) {
+            return message.reply('❌ Usage: `-auto remove <trigger_word>`\nExample: `-auto remove مرحبا`');
         }
         
-        await deleteAutoMessage(guild.id, ip);
+        await deleteAutoMessage(guild.id, trigger);
         
         const embed = new EmbedBuilder()
             .setColor(0xEF4444)
             .setTitle('🗑️ Auto Message Removed')
-            .setDescription(`Auto message for IP **${ip}** has been removed.`)
+            .setDescription(`Auto message for trigger word **${trigger}** has been removed.`)
             .setTimestamp();
         
         await message.reply({ embeds: [embed] });
@@ -1680,7 +1676,7 @@ client.on('messageCreate', async (message) => {
         const embed = new EmbedBuilder().setColor(0x5865F2).setTitle('🛡️ Commands')
             .setDescription('**Prefix:** `-`')
             .addFields(
-                { name: '📨 Auto Message (IP)', value: '`-auto mss <ip> <response>` - Set auto response for IP\n`-auto list` - List all auto messages\n`-auto remove <ip>` - Remove auto message', inline: false },
+                { name: '📨 Auto Message (Any Word)', value: '`-auto mss <word> <response>` - Set auto response for any word\n`-auto list` - List all auto messages\n`-auto remove <word>` - Remove auto message', inline: false },
                 { name: '📨 Mass DM', value: '`-mess <message>` - Send a DM to ALL members in the server', inline: false },
                 { name: '🎤 Auto Voice System', value: '`-voice add <channel_id>` - Enable auto personal VC\n`-cn <channel_id>` - Send control panel to this text channel', inline: false },
                 { name: '🤖 AI Chat', value: '`-ai <message>` - Chat naturally\n`-ask <question>` - Ask AI\n`-iahelp` - AI help', inline: false },
@@ -2306,7 +2302,7 @@ client.once('ready', async () => {
     console.log(`✅ ${client.user.tag} is online!`);
     console.log(`🤖 AI Chat System Ready - Natural Darija Support`);
     console.log(`📝 AI Commands: -ai <message> | -ask <question> | -iahelp`);
-    console.log(`📨 Auto Message (IP): -auto mss <ip> <response>`);
+    console.log(`📨 Auto Message System: -auto mss <any_word> <response>`);
     console.log(`📨 Mass DM Command: -mess <message> - Send DM to ALL members`);
     console.log(`🎉 Giveaway Command: -gv <winners> <time> <prize>`);
     console.log(`🎲 Khitar Command: -khtar <message_id> - Pick random winner from reactions`);
