@@ -51,6 +51,16 @@ db.serialize(() => {
         PRIMARY KEY (guild_id, user_id)
     )`);
     
+    // Auto Message System table (for IP responses)
+    db.run(`CREATE TABLE IF NOT EXISTS auto_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id TEXT,
+        trigger_word TEXT,
+        response TEXT,
+        created_by TEXT,
+        created_at TEXT
+    )`);
+    
     console.log('✅ Database ready');
 });
 
@@ -94,6 +104,9 @@ const messageCooldown = new Map();
 
 // Store users who had auto role (in-memory cache)
 const autoRoleUsersCache = new Set();
+
+// Auto Message System cache
+const autoMessagesCache = new Map();
 
 // Free games list
 const FREE_STEAM_GAMES = [
@@ -267,6 +280,60 @@ function getWarnCount(uid, gid) {
     });
 }
 
+// ========== AUTO MESSAGE SYSTEM FUNCTIONS ==========
+async function saveAutoMessage(guildId, triggerWord, response, createdBy) {
+    return new Promise((resolve) => {
+        db.run(`INSERT OR REPLACE INTO auto_messages (guild_id, trigger_word, response, created_by, created_at) VALUES (?, ?, ?, ?, ?)`,
+            [guildId, triggerWord.toLowerCase(), response, createdBy, new Date().toISOString()], (err) => {
+                if (!err) {
+                    autoMessagesCache.set(`${guildId}-${triggerWord.toLowerCase()}`, response);
+                }
+                resolve();
+            });
+    });
+}
+
+async function getAutoMessage(guildId, triggerWord) {
+    return new Promise((resolve) => {
+        const cached = autoMessagesCache.get(`${guildId}-${triggerWord.toLowerCase()}`);
+        if (cached) {
+            resolve(cached);
+            return;
+        }
+        
+        db.get(`SELECT response FROM auto_messages WHERE guild_id = ? AND trigger_word = ?`, 
+            [guildId, triggerWord.toLowerCase()], (err, row) => {
+                if (row && !err) {
+                    autoMessagesCache.set(`${guildId}-${triggerWord.toLowerCase()}`, row.response);
+                    resolve(row.response);
+                } else {
+                    resolve(null);
+                }
+            });
+    });
+}
+
+async function deleteAutoMessage(guildId, triggerWord) {
+    return new Promise((resolve) => {
+        db.run(`DELETE FROM auto_messages WHERE guild_id = ? AND trigger_word = ?`, 
+            [guildId, triggerWord.toLowerCase()], (err) => {
+                if (!err) {
+                    autoMessagesCache.delete(`${guildId}-${triggerWord.toLowerCase()}`);
+                }
+                resolve();
+            });
+    });
+}
+
+async function getAllAutoMessages(guildId) {
+    return new Promise((resolve) => {
+        db.all(`SELECT trigger_word, response, created_by, created_at FROM auto_messages WHERE guild_id = ?`, 
+            [guildId], (err, rows) => {
+                resolve(rows || []);
+            });
+    });
+}
+
 // ========== AUTO ROLE DATABASE FUNCTIONS ==========
 function saveAutoRoleUser(userId, guildId) {
     return new Promise((resolve) => {
@@ -406,6 +473,9 @@ async function setupVerif(msg) {
 
 // Anti-link regex - matches ALL types of links
 const LINK_REGEX = /(https?:\/\/[^\s]+|www\.[^\s]+|discord\.gg\/[^\s]+|discord\.com\/invite\/[^\s]+|steamcommunity\.com\/[^\s]+|twitch\.tv\/[^\s]+|youtube\.com\/[^\s]+|youtu\.be\/[^\s]+|twitter\.com\/[^\s]+|x\.com\/[^\s]+|t\.me\/[^\s]+|telegram\.me\/[^\s]+|roblox\.com\/[^\s]+)/i;
+
+// IP regex pattern (matches common IP address formats)
+const IP_REGEX = /\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b/;
 
 // Voice channel auto-join
 let currentVoiceConnection = null;
@@ -658,6 +728,25 @@ async function khtarWinner(message, messageId) {
             return message.reply('❌ Message not found! The message ID might be invalid or the message was deleted.');
         }
         return message.reply('❌ An error occurred while trying to pick a winner. Make sure the message ID is correct and the message has reactions.');
+    }
+}
+
+// ========== AUTO MESSAGE RESPONSE HANDLER ==========
+async function handleAutoMessage(message) {
+    if (message.author.bot) return;
+    if (message.content.startsWith('-')) return;
+    
+    // Check for IP addresses in the message
+    const ipMatch = message.content.match(IP_REGEX);
+    if (ipMatch) {
+        const ip = ipMatch[0];
+        // Check if there's an auto message set for this IP
+        const autoResponse = await getAutoMessage(message.guild.id, ip);
+        if (autoResponse) {
+            // Send the response as a reply
+            await message.reply(autoResponse);
+            console.log(`📨 Auto message triggered for IP ${ip} in ${message.guild.name}`);
+        }
     }
 }
 
@@ -1162,6 +1251,9 @@ async function handleVoiceControl(interaction) {
 
 // ========== MAIN MESSAGE HANDLER ==========
 client.on('messageCreate', async (message) => {
+    // Handle auto messages for IP addresses
+    await handleAutoMessage(message);
+    
     if (message.author.bot) return;
     if (!message.content.startsWith('-')) return;
     
@@ -1213,6 +1305,90 @@ client.on('messageCreate', async (message) => {
             )
             .setTimestamp();
         return message.reply({ embeds: [embed] });
+    }
+    
+    // ========== AUTO MESSAGE COMMANDS ==========
+    
+    // -auto mss <ip> <response> - Set auto response for an IP
+    if (cmd === 'auto' && args[0] === 'mss') {
+        if (!isMod(message.member)) {
+            return message.reply('❌ Permission denied! You need moderator permissions to use this command.');
+        }
+        
+        const ip = args[1];
+        const response = args.slice(2).join(' ');
+        
+        if (!ip || !response) {
+            return message.reply('❌ Usage: `-auto mss <ip> <response>`\n\nExample: `-auto mss 192.168.1.1 This is our server IP!`\n\nWhen someone sends that IP, the bot will reply with your message.');
+        }
+        
+        // Validate IP format
+        if (!IP_REGEX.test(ip)) {
+            return message.reply('❌ Invalid IP format! Please enter a valid IP address (e.g., 192.168.1.1)');
+        }
+        
+        await saveAutoMessage(guild.id, ip, response, message.author.id);
+        
+        const embed = new EmbedBuilder()
+            .setColor(0x22C55E)
+            .setTitle('✅ Auto Message Set')
+            .setDescription(`When someone sends the IP **${ip}**, the bot will reply with:\n> ${response}`)
+            .addFields(
+                { name: 'Trigger', value: `\`${ip}\``, inline: true },
+                { name: 'Response', value: response.substring(0, 100) + (response.length > 100 ? '...' : ''), inline: true }
+            )
+            .setTimestamp();
+        
+        await message.reply({ embeds: [embed] });
+        return;
+    }
+    
+    // -auto list - List all auto messages
+    if (cmd === 'auto' && args[0] === 'list') {
+        if (!isMod(message.member)) {
+            return message.reply('❌ Permission denied! You need moderator permissions to use this command.');
+        }
+        
+        const autoMessages = await getAllAutoMessages(guild.id);
+        
+        if (autoMessages.length === 0) {
+            return message.reply('❌ No auto messages set in this server! Use `-auto mss <ip> <response>` to add one.');
+        }
+        
+        const embed = new EmbedBuilder()
+            .setColor(0x5865F2)
+            .setTitle('📋 Auto Messages List')
+            .setDescription(autoMessages.map((msg, i) => {
+                return `${i+1}. **${msg.trigger_word}**\n   → ${msg.response.substring(0, 80)}${msg.response.length > 80 ? '...' : ''}`;
+            }).join('\n\n'))
+            .setFooter({ text: `Total: ${autoMessages.length} auto messages` })
+            .setTimestamp();
+        
+        await message.reply({ embeds: [embed] });
+        return;
+    }
+    
+    // -auto remove <ip> - Remove auto message for an IP
+    if (cmd === 'auto' && args[0] === 'remove') {
+        if (!isMod(message.member)) {
+            return message.reply('❌ Permission denied! You need moderator permissions to use this command.');
+        }
+        
+        const ip = args[1];
+        if (!ip) {
+            return message.reply('❌ Usage: `-auto remove <ip>`\nExample: `-auto remove 192.168.1.1`');
+        }
+        
+        await deleteAutoMessage(guild.id, ip);
+        
+        const embed = new EmbedBuilder()
+            .setColor(0xEF4444)
+            .setTitle('🗑️ Auto Message Removed')
+            .setDescription(`Auto message for IP **${ip}** has been removed.`)
+            .setTimestamp();
+        
+        await message.reply({ embeds: [embed] });
+        return;
     }
     
     // ========== AUTO VOICE COMMANDS ==========
@@ -1504,6 +1680,7 @@ client.on('messageCreate', async (message) => {
         const embed = new EmbedBuilder().setColor(0x5865F2).setTitle('🛡️ Commands')
             .setDescription('**Prefix:** `-`')
             .addFields(
+                { name: '📨 Auto Message (IP)', value: '`-auto mss <ip> <response>` - Set auto response for IP\n`-auto list` - List all auto messages\n`-auto remove <ip>` - Remove auto message', inline: false },
                 { name: '📨 Mass DM', value: '`-mess <message>` - Send a DM to ALL members in the server', inline: false },
                 { name: '🎤 Auto Voice System', value: '`-voice add <channel_id>` - Enable auto personal VC\n`-cn <channel_id>` - Send control panel to this text channel', inline: false },
                 { name: '🤖 AI Chat', value: '`-ai <message>` - Chat naturally\n`-ask <question>` - Ask AI\n`-iahelp` - AI help', inline: false },
@@ -2129,6 +2306,7 @@ client.once('ready', async () => {
     console.log(`✅ ${client.user.tag} is online!`);
     console.log(`🤖 AI Chat System Ready - Natural Darija Support`);
     console.log(`📝 AI Commands: -ai <message> | -ask <question> | -iahelp`);
+    console.log(`📨 Auto Message (IP): -auto mss <ip> <response>`);
     console.log(`📨 Mass DM Command: -mess <message> - Send DM to ALL members`);
     console.log(`🎉 Giveaway Command: -gv <winners> <time> <prize>`);
     console.log(`🎲 Khitar Command: -khtar <message_id> - Pick random winner from reactions`);
